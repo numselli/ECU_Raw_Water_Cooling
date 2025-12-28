@@ -690,7 +690,7 @@ void handleData() {
   json += "\"calFail\":" + String(calibFailLatched ? "true" : "false") + ",";
   json += "\"calFailMsg\":\"" + (calFailMsg.length() ? calFailMsg : calMsg) + "\",";
   json += "\"calFailNotice\":" + String(calFailNotice ? "true" : "false") + ",";
-  json += "\"calFailSerial\":" + String(calFailSerial) + ",";
+  json += "\"calFailSerial\":" + String(calibFailSerial) + ",";
   json += "\"calError\":" + String(calError ? "true" : "false") + ",";
 
   json += "\"status\":\"" + status + "\",";
