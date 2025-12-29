@@ -61,6 +61,14 @@ const uint32_t FLOW_FAULT_HOLD_MS   = 5000;    // must be low this long => fault
 const float FLOW_UNEXPECTED_LMIN = 1.5f;
 const uint32_t FLOW_UNEXPECTED_HOLD_MS = 5000;
 
+// ===== Manual flow-target control (L/min) =====
+const float FLOW_TARGET_MAX_LMIN = 60.0f;
+const uint32_t FLOW_PRIME_TIMEOUT_MS = 1500;
+const float FLOW_PRIME_DETECT_LMIN = 0.3f;
+const float FLOW_CONTROL_KP = 1.15f;
+const float FLOW_CONTROL_MAX_STEP = 6.0f;
+const float FLOW_CONTROL_HYST = 0.05f;
+
 // ===== Mute time =====
 const uint32_t MUTE_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 
@@ -81,6 +89,12 @@ Preferences prefs;
 // ================= ECU STATE =================
 volatile bool fuelActive = false;
 bool autoMode = true;
+float manualFlowTargetLmin = 0.0f;
+bool manualFlowControlActive = false;
+bool manualFlowPriming = false;
+bool manualFlowTargetChanged = false;
+uint32_t manualFlowPrimeStart = 0;
+float manualFlowControlPwmF = 0.0f;
 
 volatile int pwmCmd = 0;     // actual command applied
 int x9cPos = 0;
@@ -272,6 +286,81 @@ float expectedFlowFromCal(int pwm) {
   return NAN;
 }
 
+float estimatePwmForTargetFlow(float targetLmin) {
+  if (targetLmin <= 0.0f) return 0.0f;
+
+  if (calibrateComplete) {
+    // find surrounding points by flow
+    for (int i = 0; i < CAL_STEPS - 1; i++) {
+      float f1 = calFlowLmin[i];
+      float f2 = calFlowLmin[i+1];
+      if (targetLmin >= f1 && targetLmin <= f2 && fabsf(f2 - f1) > 0.01f) {
+        float t = (targetLmin - f1) / (f2 - f1);
+        float p1 = calPwmStep[i];
+        float p2 = calPwmStep[i+1];
+        return p1 + t * (p2 - p1);
+      }
+    }
+    // extrapolate if out of range using last slope
+    float fA = calFlowLmin[CAL_STEPS-2];
+    float fB = calFlowLmin[CAL_STEPS-1];
+    float pA = calPwmStep[CAL_STEPS-2];
+    float pB = calPwmStep[CAL_STEPS-1];
+    float slope = (fabsf(fB - fA) < 0.01f) ? 0.0f : ((pB - pA) / (fB - fA));
+    float extra = slope * (targetLmin - fB);
+    return pB + extra;
+  }
+
+  // Fallback: simple linear map to the PWM window
+  float frac = targetLmin / FLOW_TARGET_MAX_LMIN;
+  if (frac < 0.0f) frac = 0.0f;
+  if (frac > 1.0f) frac = 1.0f;
+  return PUMP_PWM_MIN + frac * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
+}
+
+void resetManualFlowControl(bool clearTarget) {
+  manualFlowControlActive = false;
+  manualFlowPriming = false;
+  manualFlowTargetChanged = false;
+  manualFlowPrimeStart = 0;
+  manualFlowControlPwmF = 0.0f;
+  if (clearTarget) manualFlowTargetLmin = 0.0f;
+}
+
+int updateManualFlowControl(uint32_t now) {
+  if (!manualFlowControlActive || manualFlowTargetLmin <= FLOW_CONTROL_HYST) return pwmCmd;
+
+  if (manualFlowPriming) {
+    pwmCmd = 99;
+    if (manualFlowPrimeStart == 0) manualFlowPrimeStart = now;
+    bool flowDetected = flow_Lmin >= FLOW_PRIME_DETECT_LMIN;
+    bool timedOut = (now - manualFlowPrimeStart) >= FLOW_PRIME_TIMEOUT_MS;
+    if (flowDetected || timedOut) {
+      manualFlowPriming = false;
+      manualFlowTargetChanged = true; // seed with map estimate
+    }
+    return pwmCmd;
+  }
+
+  if (manualFlowTargetChanged) {
+    float guess = estimatePwmForTargetFlow(manualFlowTargetLmin);
+    manualFlowControlPwmF = constrain(guess, float(PUMP_PWM_MIN), 99.0f);
+    manualFlowTargetChanged = false;
+  }
+
+  float error = manualFlowTargetLmin - flow_Lmin;
+  if (fabsf(error) > FLOW_CONTROL_HYST) {
+    float delta = error * FLOW_CONTROL_KP;
+    if (delta > FLOW_CONTROL_MAX_STEP) delta = FLOW_CONTROL_MAX_STEP;
+    if (delta < -FLOW_CONTROL_MAX_STEP) delta = -FLOW_CONTROL_MAX_STEP;
+    manualFlowControlPwmF += delta;
+  }
+
+  manualFlowControlPwmF = constrain(manualFlowControlPwmF, float(PUMP_PWM_MIN), 99.0f);
+  pwmCmd = int(manualFlowControlPwmF + 0.5f);
+  return pwmCmd;
+}
+
 // ===== Calibration validation =====
 bool validateCalibrationTable(const float* t, String &reason) {
   float minV = 1e9f, maxV = -1e9f;
@@ -402,7 +491,12 @@ String pageHTML() {
     .mode-btn.manual { background: #0b6cff; color: white; border-color: #0b6cff; }
     button { padding: 10px 12px; border-radius: 10px; border: 1px solid #aaa; background: #fafafa; }
     button:disabled { opacity: 0.45; }
-    input[type=range] { height: 32px; }
+    input[type=range] { height: 44px; -webkit-appearance: none; appearance: none; background: transparent; }
+    input[type=range]:focus { outline: none; }
+    input[type=range]::-webkit-slider-runnable-track { height: 12px; background: #e2e2e2; border-radius: 12px; border: 1px solid #c8c8c8; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 28px; height: 28px; background: #0b6cff; border-radius: 50%; margin-top: -9px; border: 1px solid #0b6cff; }
+    input[type=range]::-moz-range-track { height: 12px; background: #e2e2e2; border-radius: 12px; border: 1px solid #c8c8c8; }
+    input[type=range]::-moz-range-thumb { width: 28px; height: 28px; background: #0b6cff; border-radius: 50%; border: 1px solid #0b6cff; }
     .spacer { height: 14px; }
   </style>
 </head>
@@ -466,6 +560,10 @@ String pageHTML() {
   <div class="card">
     <div class="big">Manual PWM: <span id="sval">0</span></div>
     <input type="range" min="0" max="99" value="0" id="slider" style="width:100%;" oninput="setPWM(this.value)">
+    <div class="spacer"></div>
+    <div class="big">Target Flow (L/min): <span id="flowSval">0</span></div>
+    <input type="range" min="0" max="60" step="0.5" value="0" id="flowSlider" style="width:100%;" oninput="setFlowTarget(this.value)">
+    <div class="small muted">Set flow &gt;0 to enable semi-automatic control (priming burst, then closed-loop).</div>
 
     <div class="spacer"></div>
 
@@ -496,11 +594,17 @@ let sliderActive = false;
 let pendingPwmValue = null;
 let sendingPwm = false;
 
+let flowSliderActive = false;
+let pendingFlowValue = null;
+let sendingFlow = false;
+
 const sliderEl = document.getElementById("slider");
-sliderEl.addEventListener("pointerdown", () => { sliderActive = true; });
-sliderEl.addEventListener("pointerup",   () => { sliderActive = false; });
-sliderEl.addEventListener("pointercancel", () => { sliderActive = false; });
-sliderEl.addEventListener("pointerleave",  () => { sliderActive = false; });
+["pointerdown","touchstart","mousedown"].forEach(evt => sliderEl.addEventListener(evt, () => { sliderActive = true; }));
+["pointerup","pointercancel","pointerleave","touchend","touchcancel","mouseup"].forEach(evt => sliderEl.addEventListener(evt, () => { sliderActive = false; }));
+
+const flowSliderEl = document.getElementById("flowSlider");
+["pointerdown","touchstart","mousedown"].forEach(evt => flowSliderEl.addEventListener(evt, () => { flowSliderActive = true; }));
+["pointerup","pointercancel","pointerleave","touchend","touchcancel","mouseup"].forEach(evt => flowSliderEl.addEventListener(evt, () => { flowSliderActive = false; }));
 
 async function refresh(){
   try{
@@ -549,8 +653,10 @@ async function refresh(){
     const relayPowered = !!d.alarmRelaySilenced;
     relayStatus.textContent = relayPowered ? "On" : "Off";
 
+    const flowTarget = (typeof d.flowTargetLmin === "number") ? d.flowTargetLmin : 0;
     const manual = !currentAutoMode;
-    sliderEl.disabled = !manual || d.calibrating;
+    sliderEl.disabled = !manual || d.calibrating || flowTarget > 0.05;
+    flowSliderEl.disabled = !manual || d.calibrating;
     calibBtn.disabled = !manual || d.calibrating;
     restoreBtn.disabled = !manual || d.calibrating;   // ONLY manual mode
     restoreBtn.style.display = manual ? "inline" : "none";
@@ -564,6 +670,9 @@ async function refresh(){
 
     sval.textContent  = d.pwm;
     if (!sliderActive) sliderEl.value = d.pwm;
+
+    flowSval.textContent = flowTarget.toFixed(1);
+    if (!flowSliderActive) flowSliderEl.value = flowTarget;
 
     // cal table display
     if (Array.isArray(d.cal) && d.cal.length === 9) {
@@ -591,6 +700,10 @@ async function refresh(){
 async function setPWM(v){
   const val = Number(v);
   sval.textContent = val;
+  if (flowSliderEl) {
+    flowSliderEl.value = 0;
+    flowSval.textContent = "0.0";
+  }
   pendingPwmValue = val;
   if (sendingPwm) return;
 
@@ -605,6 +718,25 @@ async function setPWM(v){
     }
   }
   sendingPwm = false;
+}
+
+async function setFlowTarget(v){
+  const val = Number(v);
+  flowSval.textContent = val.toFixed(1);
+  pendingFlowValue = val;
+  if (sendingFlow) return;
+
+  sendingFlow = true;
+  while (pendingFlowValue !== null) {
+    const next = pendingFlowValue;
+    pendingFlowValue = null;
+    try {
+      await fetch('/set?flow=' + next);
+    } catch(e) {
+      // swallow
+    }
+  }
+  sendingFlow = false;
 }
 
 async function toggleMode(){
@@ -749,6 +881,7 @@ void handleData() {
   json += "\"flowLh\":"   + String(flow_Lh, 1) + ",";
   json += "\"flowHz\":"   + String(fHz, 2) + ",";
   json += "\"flowDp\":"   + String((uint32_t)flowDpLast) + ",";
+  json += "\"flowTargetLmin\":" + String(manualFlowTargetLmin, 2) + ",";
 
   json += "\"tCat\":" + (isNum(tCat) ? String(tCat, 1) : String("null")) + ",";
   json += "\"tMix\":" + (isNum(tMix) ? String(tMix, 1) : String("null")) + ",";
@@ -795,6 +928,7 @@ void handleSet() {
   if (server.hasArg("pwm")) {
     int v = constrain(server.arg("pwm").toInt(), 0, 99);
     if (!autoMode && !calibrating) {
+      resetManualFlowControl(true); // direct PWM overrides flow target
       pwmCmd = v;
       x9cSet(pwmCmd);
     }
@@ -808,6 +942,26 @@ void handleSet() {
     } else if (m == "auto") {
       autoMode = true;
       manualAlarmOverride = false;
+      resetManualFlowControl(true);
+    }
+  }
+
+  if (server.hasArg("flow")) {
+    float target = server.arg("flow").toFloat();
+    if (target < 0.0f) target = 0.0f;
+    if (target > FLOW_TARGET_MAX_LMIN) target = FLOW_TARGET_MAX_LMIN;
+    if (!autoMode && !calibrating) {
+      manualFlowTargetLmin = target;
+      if (target <= FLOW_CONTROL_HYST) {
+        resetManualFlowControl(false);
+        pwmCmd = 0;
+        x9cSet(pwmCmd);
+      } else {
+        manualFlowControlActive = true;
+        manualFlowPriming = true;
+        manualFlowTargetChanged = true;
+        manualFlowPrimeStart = millis();
+      }
     }
   }
 
@@ -845,6 +999,8 @@ void handleCalibrate() {
     return;
   }
 
+  resetManualFlowControl(true);
+
   // snapshot current calibration in RAM
   for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
   hasLastGoodInRam = true;
@@ -874,6 +1030,8 @@ void handleRestore() {
     server.send(400, "text/plain; charset=utf-8", "ERROR: calibrating");
     return;
   }
+
+  resetManualFlowControl(true);
 
   // Write defaults to NVS ON PURPOSE
   saveCalToNVS(DEFAULT_CAL_FLOW_LMIN);
@@ -1059,6 +1217,7 @@ void updateTemps() {
 void updatePumpControlAndFlowChecks() {
   if (calibrating) return;
 
+  uint32_t now = millis();
   int targetPwm = 0;
   bool engineRunning = (fuelActive && rpmValue > ENGINE_RPM_MIN);
 
@@ -1083,12 +1242,14 @@ void updatePumpControlAndFlowChecks() {
       boostActive = false;
     }
   } else {
-    targetPwm = pwmCmd;
     boostActive = false;
+    if (manualFlowControlActive && manualFlowTargetLmin > FLOW_CONTROL_HYST) {
+      pwmCmd = updateManualFlowControl(now);
+    }
+    targetPwm = pwmCmd;
   }
 
   int effectivePwm = autoMode ? targetPwm : pwmCmd;
-  uint32_t now = millis();
   bool pumpShouldBeOn = (effectivePwm >= PUMP_PWM_MIN);
 
   // NO FLOW (pump ON but flow below threshold for long enough)
@@ -1146,6 +1307,8 @@ void updatePumpControlAndFlowChecks() {
 
   if (autoMode) {
     pwmCmd = targetPwm;
+    x9cSet(pwmCmd);
+  } else if (manualFlowControlActive && manualFlowTargetLmin > FLOW_CONTROL_HYST) {
     x9cSet(pwmCmd);
   }
 }
