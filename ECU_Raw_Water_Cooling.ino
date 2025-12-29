@@ -363,6 +363,14 @@ float flowSlopeFromCalAtPwm(float pwm) {
   return max(FLOW_CONTROL_SLOPE_FLOOR, slope);
 }
 
+float autoFlowTargetFromRpm(float rpm) {
+  // Clamp-based starter curve: ~6 L/min at 1000 RPM up to ~45 L/min
+  float q = 6.0f + 0.018f * (rpm - 1000.0f);
+  if (q < 6.0f) q = 6.0f;
+  if (q > 45.0f) q = 45.0f;
+  return q;
+}
+
 void resetManualFlowControl(bool clearTarget) {
   manualFlowControlActive = false;
   manualFlowPriming = false;
@@ -1293,23 +1301,26 @@ void updatePumpControlAndFlowChecks() {
 
   if (autoMode) {
     if (engineRunning) {
-      float rpmClamped = rpmValue;
-      if (rpmClamped > PUMP_RPM_MAX) rpmClamped = PUMP_RPM_MAX;
-      if (rpmClamped < ENGINE_RPM_MIN) rpmClamped = ENGINE_RPM_MIN;
+      float targetFlow = autoFlowTargetFromRpm(rpmValue);
+      if (!manualFlowControlActive || fabsf(targetFlow - manualFlowTargetLmin) > FLOW_CONTROL_HYST) {
+        manualFlowTargetChanged = true;
+      }
+      manualFlowControlActive = true;
+      manualFlowTargetLmin = targetFlow;
 
-      float fraction = (rpmClamped - ENGINE_RPM_MIN) / float(PUMP_RPM_MAX - ENGINE_RPM_MIN);
-      float basePwmF = PUMP_PWM_MIN + fraction * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
-      basePwmF = constrain(basePwmF, 0.0f, 99.0f);
-      targetPwm = int(basePwmF + 0.5f);
+      pwmCmd = updateManualFlowControl(now);
+      targetPwm = pwmCmd;
 
       if (!boostActive && isNum(tMix) && tMix >= MIX_HIGH_C) boostActive = true;
       if (boostActive && isNum(tMix) && tMix <= (MIX_HIGH_C - 5.0f)) boostActive = false;
 
       if (isNum(tMix) && tMix >= MIX_CRIT_C) targetPwm = 99;
       else if (boostActive) targetPwm = min(99, targetPwm + 10);
+      manualFlowControlPwmF = targetPwm;
     } else {
       targetPwm = 0;
       boostActive = false;
+      resetManualFlowControl(true);
     }
   } else {
     boostActive = false;
