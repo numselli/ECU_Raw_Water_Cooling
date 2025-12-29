@@ -66,8 +66,17 @@ const float FLOW_TARGET_MAX_LMIN = 60.0f;
 const uint32_t FLOW_PRIME_TIMEOUT_MS = 1500;
 const float FLOW_PRIME_DETECT_LMIN = 0.3f;
 const float FLOW_CONTROL_KP = 1.15f;
-const float FLOW_CONTROL_MAX_STEP = 6.0f;
 const float FLOW_CONTROL_HYST = 0.05f;
+const float FLOW_CONTROL_TARGET_TOL_FRAC = 0.01f;   // try to stay within 1% of target
+const float FLOW_CONTROL_MIN_STEP = 0.2f;           // minimum adjustment when reacting
+const float FLOW_CONTROL_STEP_UP_PPS = 10.0f;       // closed-loop increase rate (PWM per second)
+const float FLOW_CONTROL_STEP_DOWN_PPS = 10.0f;     // closed-loop decrease rate (PWM per second)
+const float FLOW_CONTROL_SLOPE_FLOOR = 0.08f;       // l/min per PWM step used for division safety
+const float FLOW_CONTROL_FEED_FORWARD_BLEND = 0.20f;// blend between measured-error and map pull
+const float FLOW_CONTROL_RAMP_RATE_PPS = 10.0f;     // max PWM change per second when leaving prime
+const uint32_t FLOW_CONTROL_UPDATE_MS = 100;        // wait for sensor settle between adjustments (ms)
+const float FLOW_CONTROL_KI = 0.8f;                 // integral gain (PWM per L/min * second)
+const float FLOW_CONTROL_I_CLAMP = 25.0f;           // clamp for integral term (PWM)
 
 // ===== Mute time =====
 const uint32_t MUTE_MS = 5UL * 60UL * 1000UL;  // 5 minutes
@@ -95,6 +104,10 @@ bool manualFlowPriming = false;
 bool manualFlowTargetChanged = false;
 uint32_t manualFlowPrimeStart = 0;
 float manualFlowControlPwmF = 0.0f;
+bool manualFlowRamping = false;
+float manualFlowRampTarget = 0.0f;
+uint32_t manualFlowLastAdjustMs = 0;
+float manualFlowIntegral = 0.0f;
 
 volatile int pwmCmd = 0;     // actual command applied
 int x9cPos = 0;
@@ -318,20 +331,53 @@ float estimatePwmForTargetFlow(float targetLmin) {
   return PUMP_PWM_MIN + frac * float(PUMP_PWM_MAX - PUMP_PWM_MIN);
 }
 
+float flowSlopeFromCalAtPwm(float pwm) {
+  if (!calibrateComplete) return FLOW_CONTROL_SLOPE_FLOOR;
+
+  if (pwm <= calPwmStep[0]) {
+    float slope = (calFlowLmin[1] - calFlowLmin[0]) / float(calPwmStep[1] - calPwmStep[0]);
+    return max(FLOW_CONTROL_SLOPE_FLOOR, slope);
+  }
+
+  for (int i = 0; i < CAL_STEPS - 1; i++) {
+    float p1 = calPwmStep[i];
+    float p2 = calPwmStep[i+1];
+    if (pwm >= p1 && pwm <= p2) {
+      float slope = (calFlowLmin[i+1] - calFlowLmin[i]) / float(p2 - p1);
+      return max(FLOW_CONTROL_SLOPE_FLOOR, slope);
+    }
+  }
+
+  float slope = (calFlowLmin[CAL_STEPS-1] - calFlowLmin[CAL_STEPS-2]) /
+                float(calPwmStep[CAL_STEPS-1] - calPwmStep[CAL_STEPS-2]);
+  return max(FLOW_CONTROL_SLOPE_FLOOR, slope);
+}
+
 void resetManualFlowControl(bool clearTarget) {
   manualFlowControlActive = false;
   manualFlowPriming = false;
   manualFlowTargetChanged = false;
   manualFlowPrimeStart = 0;
   manualFlowControlPwmF = 0.0f;
+  manualFlowRamping = false;
+  manualFlowRampTarget = 0.0f;
+  manualFlowLastAdjustMs = 0;
+  manualFlowIntegral = 0.0f;
   if (clearTarget) manualFlowTargetLmin = 0.0f;
 }
 
 int updateManualFlowControl(uint32_t now) {
   if (!manualFlowControlActive || manualFlowTargetLmin <= FLOW_CONTROL_HYST) return pwmCmd;
 
+  // If we already have flow, skip priming and go straight to ramp/closed loop
+  if (manualFlowPriming && flow_Lmin >= FLOW_PRIME_DETECT_LMIN) {
+    manualFlowPriming = false;
+    manualFlowTargetChanged = true;
+  }
+
   if (manualFlowPriming) {
     pwmCmd = 99;
+    manualFlowControlPwmF = 99.0f;
     if (manualFlowPrimeStart == 0) manualFlowPrimeStart = now;
     bool flowDetected = flow_Lmin >= FLOW_PRIME_DETECT_LMIN;
     bool timedOut = (now - manualFlowPrimeStart) >= FLOW_PRIME_TIMEOUT_MS;
@@ -344,16 +390,74 @@ int updateManualFlowControl(uint32_t now) {
 
   if (manualFlowTargetChanged) {
     float guess = estimatePwmForTargetFlow(manualFlowTargetLmin);
-    manualFlowControlPwmF = constrain(guess, float(PUMP_PWM_MIN), 99.0f);
+    float constrainedGuess = constrain(guess, float(PUMP_PWM_MIN), 99.0f);
     manualFlowTargetChanged = false;
+    manualFlowRamping = true;
+    manualFlowRampTarget = constrainedGuess;
+    manualFlowLastAdjustMs = now;
+    manualFlowIntegral = 0.0f;
+    // start ramping from the current applied PWM
+    manualFlowControlPwmF = pwmCmd;
+    pwmCmd = int(manualFlowControlPwmF + 0.5f);
+    return pwmCmd;
   }
 
-  float error = manualFlowTargetLmin - flow_Lmin;
-  if (fabsf(error) > FLOW_CONTROL_HYST) {
-    float delta = error * FLOW_CONTROL_KP;
-    if (delta > FLOW_CONTROL_MAX_STEP) delta = FLOW_CONTROL_MAX_STEP;
-    if (delta < -FLOW_CONTROL_MAX_STEP) delta = -FLOW_CONTROL_MAX_STEP;
-    manualFlowControlPwmF += delta;
+  if (manualFlowRamping) {
+    uint32_t dtMs = now - manualFlowLastAdjustMs;
+    if (dtMs >= FLOW_CONTROL_UPDATE_MS) {
+      manualFlowLastAdjustMs = now;
+      float delta = manualFlowRampTarget - manualFlowControlPwmF;
+      float stepLimit = FLOW_CONTROL_RAMP_RATE_PPS * (dtMs / 1000.0f);
+      delta = constrain(delta, -stepLimit, stepLimit);
+      // Ensure minimum movement so we progress toward the ramp target
+      if (fabsf(delta) < FLOW_CONTROL_MIN_STEP) delta = (delta >= 0.0f) ? FLOW_CONTROL_MIN_STEP : -FLOW_CONTROL_MIN_STEP;
+      manualFlowControlPwmF += delta;
+      if (fabsf(manualFlowRampTarget - manualFlowControlPwmF) <= FLOW_CONTROL_MIN_STEP) {
+        manualFlowControlPwmF = manualFlowRampTarget;
+        manualFlowRamping = false;
+      }
+    }
+    manualFlowControlPwmF = constrain(manualFlowControlPwmF, float(PUMP_PWM_MIN), 99.0f);
+    pwmCmd = int(manualFlowControlPwmF + 0.5f);
+    return pwmCmd;
+  }
+
+  float target = manualFlowTargetLmin;
+  float error = target - flow_Lmin;
+  float tol = max(target * FLOW_CONTROL_TARGET_TOL_FRAC, FLOW_CONTROL_HYST);
+
+  float feedForwardPwm = estimatePwmForTargetFlow(target);
+
+  uint32_t dtMs = now - manualFlowLastAdjustMs;
+  if (fabsf(error) > tol && dtMs >= FLOW_CONTROL_UPDATE_MS) {
+    manualFlowLastAdjustMs = now;
+    float slope = flowSlopeFromCalAtPwm(manualFlowControlPwmF);
+    float pwmPerLmin = 1.0f / max(FLOW_CONTROL_SLOPE_FLOOR, slope);
+    float delta = error * pwmPerLmin * FLOW_CONTROL_KP;
+
+    float stepLimit = (delta >= 0.0f ? FLOW_CONTROL_STEP_UP_PPS : FLOW_CONTROL_STEP_DOWN_PPS) * (dtMs / 1000.0f);
+    if (delta > stepLimit) delta = stepLimit;
+    if (delta < -stepLimit) delta = -stepLimit;
+    if (fabsf(delta) < FLOW_CONTROL_MIN_STEP) delta = (delta >= 0.0f) ? FLOW_CONTROL_MIN_STEP : -FLOW_CONTROL_MIN_STEP;
+
+    float ffDelta = 0.0f;
+    if (isNum(feedForwardPwm)) {
+      ffDelta = (feedForwardPwm - manualFlowControlPwmF) * FLOW_CONTROL_FEED_FORWARD_BLEND;
+      float ffLimit = stepLimit * FLOW_CONTROL_FEED_FORWARD_BLEND;
+      if (ffDelta > ffLimit) ffDelta = ffLimit;
+      if (ffDelta < -ffLimit) ffDelta = -ffLimit;
+    }
+
+    manualFlowControlPwmF += delta + ffDelta;
+    // Integral correction to burn off steady-state error from calibration mismatch
+    float dtSec = dtMs / 1000.0f;
+    manualFlowIntegral += error * dtSec * FLOW_CONTROL_KI;
+    manualFlowIntegral = constrain(manualFlowIntegral, -FLOW_CONTROL_I_CLAMP, FLOW_CONTROL_I_CLAMP);
+    manualFlowControlPwmF += manualFlowIntegral;
+  } else if (isNum(feedForwardPwm)) {
+    // Within tolerance: gently converge to feed-forward map to avoid drift
+    float ffDelta = (feedForwardPwm - manualFlowControlPwmF) * (FLOW_CONTROL_FEED_FORWARD_BLEND * 0.5f);
+    manualFlowControlPwmF += ffDelta;
   }
 
   manualFlowControlPwmF = constrain(manualFlowControlPwmF, float(PUMP_PWM_MIN), 99.0f);
