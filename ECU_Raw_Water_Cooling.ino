@@ -837,7 +837,7 @@ String pageHTML() {
       <div>Calibration Table</div>
       <div class="mono" id="caltable">...</div>
     </div>
-    <div class="row small">
+    <div class="row small manual-only" id="flowCalScaleRow">
       <div>Flow cal scale</div>
       <div class="mono" id="flowScaleDisplay">...</div>
     </div>
@@ -853,7 +853,7 @@ String pageHTML() {
 
     <div class="spacer"></div>
 
-    <div class="field-row">
+    <div class="field-row manual-only" id="flowCalScaleControls">
       <label for="flowCalScaleInput" class="big">Flow cal scale:</label>
       <input id="flowCalScaleInput" type="number" min="0.1" max="10" step="0.01" value="1.00">
       <button onclick="saveFlowCalScale()">Save</button>
@@ -862,7 +862,7 @@ String pageHTML() {
 
     <div class="spacer"></div>
 
-    <button id="calibBtn" onclick="startCalibration()">Calibrate</button>
+    <button id="calibBtn" class="manual-only" onclick="startCalibration()">Calibrate</button>
 
     <div class="spacer"></div>
 
@@ -920,6 +920,9 @@ const logModal = document.getElementById("logModal");
 const logList = document.getElementById("logList");
 const flowCalScaleInput = document.getElementById("flowCalScaleInput");
 const flowScaleDisplay = document.getElementById("flowScaleDisplay");
+const flowCalScaleRow = document.getElementById("flowCalScaleRow");
+const flowCalScaleControls = document.getElementById("flowCalScaleControls");
+const manualOnlyEls = Array.from(document.querySelectorAll(".manual-only"));
 
 function formatLogValue(v){
   if (v === null || Number.isNaN(v) || typeof v !== "number") return "n/a";
@@ -1008,7 +1011,8 @@ async function refresh(){
 
     pwm.textContent   = d.pwm;
     x9c.textContent   = d.x9c;
-    alarm.textContent = d.alarm ? "ON" : "off";
+    const alarmLevelText = (typeof d.alarmLevel === "number" && d.alarmLevel > 0) ? ` (Level ${d.alarmLevel})` : "";
+    alarm.textContent = d.alarm ? `ON${alarmLevelText}` : "off";
 
     applyLevel(tmix, Number(d.tMixLevel || 0));
     applyLevel(tcat, Number(d.tCatLevel || 0));
@@ -1034,6 +1038,10 @@ async function refresh(){
 
     const flowTarget = (typeof d.flowTargetLmin === "number") ? d.flowTargetLmin : 0;
     const manual = !currentAutoMode;
+    manualOnlyEls.forEach(el => {
+      if (!el) return;
+      el.style.display = manual ? "" : "none";
+    });
     sliderEl.disabled = !manual || d.calibrating || flowTarget > 0.05;
     flowSliderEl.disabled = !manual || d.calibrating;
     calibBtn.disabled = !manual || d.calibrating;
