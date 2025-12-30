@@ -1447,8 +1447,8 @@ void updateAlarmLogic() {
   }
 
   if (flowNoMoveFault)        { newLevel = max(newLevel, 3); any = true; }
-  if (flowUnexpectedFault)    { newLevel = max(newLevel, 2); any = true; }
-  if (flowRestrictFault)      { newLevel = max(newLevel, 1); any = true; }
+  if (flowUnexpectedFault)    { newLevel = max(newLevel, 3); any = true; }
+  if (flowRestrictFault)      { newLevel = max(newLevel, 2); any = true; }
   if (flowCalMismatchFault)   { newLevel = max(newLevel, 2); any = true; }
 
   if (calWarningLevel1)       { newLevel = max(newLevel, 1); any = true; }
