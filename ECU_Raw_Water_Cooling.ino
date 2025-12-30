@@ -20,10 +20,12 @@
 #define RELAY_ALARM  10   // GPIO10 -> Alarm relay (NC strategy)
 
 // ================= USER CALIBRATION / TUNING =================
-// Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => 330 pulses per liter (tune with FLOW_CAL_SCALE if needed)
+// Flow sensor label: F(Hz) = 5.5 * Q(L/min)  => 330 pulses per liter (tune with flowCalScale if needed)
 const float FLOW_PULSES_PER_LITER = 330.0f;    // datasheet value
 const float FLOW_HZ_PER_LMIN      = FLOW_PULSES_PER_LITER / 60.0f; // 5.5 Hz per L/min
-const float FLOW_CAL_SCALE        = 2.0f;      // empirical correction (1.7 L/min target filled 1.7 L in ~15 s)
+const float FLOW_CAL_SCALE_DEFAULT = 1.0f;     // default scale when nothing stored
+float flowCalScale = FLOW_CAL_SCALE_DEFAULT;   // persisted scale factor (editable)
+bool flowCalScaleNeedsPersist = false;
 
 // Hall RPM: 2 magnets on crank => 2 pulses per revolution (counting ONE edge only)
 const float RPM_PULSES_PER_REV = 2.0f;
@@ -136,8 +138,6 @@ volatile uint32_t rpmHz_x100 = 0;
 volatile uint32_t rpmDpLast  = 0;
 bool hallSensorFault = false;
 uint32_t rpmLowFaultSince = 0;
-bool hallSensorFault = false;
-uint32_t rpmLowFaultSince = 0;
 
 // Alarm
 bool alarmActive = false;
@@ -162,6 +162,40 @@ uint32_t flowCalSampleMs = 0;
 float    flowCalAccum = 0.0f;
 uint32_t flowCalCount = 0;
 int      flowCalBadCount = 0;
+
+// ================= Event logging =================
+enum EventCode : uint8_t {
+  EVENT_MIX_WARN = 1,
+  EVENT_MIX_HIGH,
+  EVENT_MIX_CRIT,
+  EVENT_MIX_SENSOR_FAULT,
+  EVENT_CAT_HIGH,
+  EVENT_CAT_CRIT,
+  EVENT_CAT_SENSOR_FAULT,
+  EVENT_FLOW_NO_MOVE,
+  EVENT_FLOW_RESTRICT,
+  EVENT_FLOW_UNEXPECTED,
+  EVENT_FLOW_CAL_MISMATCH,
+  EVENT_CAL_ATTENTION,
+  EVENT_HALL_FAULT
+};
+
+struct EventLogEntry {
+  uint32_t tsMs;
+  uint8_t code;
+  uint8_t reserved[3];
+  float value;
+};
+
+const uint8_t EVENT_LOG_CAPACITY = 10;
+
+struct EventLog {
+  EventLogEntry entries[EVENT_LOG_CAPACITY];
+  uint8_t count;
+  uint8_t head; // index of next write
+};
+
+EventLog eventLog = {};
 
 // ================= Calibration table =================
 const int CAL_STEPS = 9;
@@ -194,13 +228,36 @@ bool calUsingDefault = false;
 
 // ============ NVS layout (robust: magic + version + crc) ============
 static const uint32_t CAL_MAGIC = 0xEC0CA1B0;
-static const uint16_t CAL_VER   = 1;
+static const uint16_t CAL_VER   = 2;
+static const uint32_t LOG_MAGIC = 0xEC0E1701;
+static const uint16_t LOG_VER   = 1;
 
 struct CalBlob {
   uint32_t magic;
   uint16_t ver;
   uint16_t reserved;
   float table[CAL_STEPS];
+  float flowCalScale;
+  uint32_t crc32;
+};
+
+// Legacy V1 blob (no flowCalScale)
+struct CalBlobV1 {
+  uint32_t magic;
+  uint16_t ver;
+  uint16_t reserved;
+  float table[CAL_STEPS];
+  uint32_t crc32;
+};
+
+struct EventLogBlob {
+  uint32_t magic;
+  uint16_t ver;
+  uint16_t reserved;
+  EventLogEntry entries[EVENT_LOG_CAPACITY];
+  uint8_t count;
+  uint8_t head;
+  uint16_t reserved2;
   uint32_t crc32;
 };
 
@@ -496,11 +553,37 @@ bool loadCalFromNVS(float* outTable, CalState &stateOut) {
   prefs.begin("ECU", true);
   size_t len = prefs.getBytesLength("calblob");
   if (len != sizeof(CalBlob)) {
+    if (len == sizeof(CalBlobV1)) {
+      CalBlobV1 blobV1;
+      prefs.getBytes("calblob", &blobV1, sizeof(blobV1));
+      prefs.end();
+
+      // validate legacy blob
+      if (blobV1.magic == CAL_MAGIC && blobV1.ver == 1) {
+        uint32_t crc = crc32_calc((const uint8_t*)(&blobV1), sizeof(blobV1) - sizeof(blobV1.crc32));
+        if (crc == blobV1.crc32) {
+          for (int i = 0; i < CAL_STEPS; i++) outTable[i] = blobV1.table[i];
+          flowCalScale = FLOW_CAL_SCALE_DEFAULT;
+          flowCalScaleNeedsPersist = true; // migrate forward
+          if (tableAllZero(outTable)) {
+            stateOut = CAL_DEFAULT_RECOMMENDED;
+            return true;
+          }
+          stateOut = CAL_OK;
+          return true;
+        }
+      }
+      stateOut = CAL_ERROR;
+      return false;
+    }
+
     prefs.end();
     if (len > 0) {
       stateOut = CAL_ERROR; // something stored but wrong size
     } else {
       stateOut = CAL_DEFAULT_RECOMMENDED; // nothing stored
+      flowCalScale = FLOW_CAL_SCALE_DEFAULT;
+      flowCalScaleNeedsPersist = true; // persist default on first save
     }
     return false;
   }
@@ -523,6 +606,11 @@ bool loadCalFromNVS(float* outTable, CalState &stateOut) {
 
   // copy out
   for (int i = 0; i < CAL_STEPS; i++) outTable[i] = blob.table[i];
+  flowCalScale = blob.flowCalScale;
+  if (!isNum(flowCalScale) || flowCalScale <= 0.0f || flowCalScale > 10.0f) {
+    flowCalScale = FLOW_CAL_SCALE_DEFAULT;
+    flowCalScaleNeedsPersist = true;
+  }
 
   if (tableAllZero(outTable)) {
     stateOut = CAL_DEFAULT_RECOMMENDED; // all zeros means "needs calibration"
@@ -539,11 +627,106 @@ void saveCalToNVS(const float* table) {
   blob.ver = CAL_VER;
   blob.reserved = 0;
   for (int i = 0; i < CAL_STEPS; i++) blob.table[i] = table[i];
+  blob.flowCalScale = flowCalScale;
   blob.crc32 = crc32_calc((const uint8_t*)(&blob), sizeof(blob) - sizeof(blob.crc32));
 
   prefs.begin("ECU", false);
   prefs.putBytes("calblob", &blob, sizeof(blob));
   prefs.end();
+
+  flowCalScaleNeedsPersist = false;
+}
+
+String eventLabel(uint8_t code) {
+  switch (code) {
+    case EVENT_MIX_WARN: return "Mixer temp warning";
+    case EVENT_MIX_HIGH: return "Mixer temp high";
+    case EVENT_MIX_CRIT: return "Mixer temp critical";
+    case EVENT_MIX_SENSOR_FAULT: return "Mixer sensor fault";
+    case EVENT_CAT_HIGH: return "Catalyst temp high";
+    case EVENT_CAT_CRIT: return "Catalyst temp critical";
+    case EVENT_CAT_SENSOR_FAULT: return "Catalyst sensor fault";
+    case EVENT_FLOW_NO_MOVE: return "No flow";
+    case EVENT_FLOW_RESTRICT: return "Flow restriction";
+    case EVENT_FLOW_UNEXPECTED: return "Unexpected flow";
+    case EVENT_FLOW_CAL_MISMATCH: return "Flow vs calibration mismatch";
+    case EVENT_CAL_ATTENTION: return "Calibration attention";
+    case EVENT_HALL_FAULT: return "Hall sensor fault";
+    default: return "Unknown event";
+  }
+}
+
+void saveEventLogToNVS() {
+  EventLogBlob blob;
+  blob.magic = LOG_MAGIC;
+  blob.ver = LOG_VER;
+  blob.reserved = 0;
+  for (int i = 0; i < EVENT_LOG_CAPACITY; i++) blob.entries[i] = eventLog.entries[i];
+  blob.count = eventLog.count;
+  blob.head = eventLog.head;
+  blob.reserved2 = 0;
+  blob.crc32 = crc32_calc((const uint8_t*)(&blob), sizeof(blob) - sizeof(blob.crc32));
+
+  prefs.begin("ECU", false);
+  prefs.putBytes("elog", &blob, sizeof(blob));
+  prefs.end();
+}
+
+bool loadEventLogFromNVS() {
+  prefs.begin("ECU", true);
+  size_t len = prefs.getBytesLength("elog");
+  if (len != sizeof(EventLogBlob)) {
+    prefs.end();
+    eventLog = {};
+    return false;
+  }
+
+  EventLogBlob blob;
+  prefs.getBytes("elog", &blob, sizeof(blob));
+  prefs.end();
+
+  if (blob.magic != LOG_MAGIC || blob.ver != LOG_VER) {
+    eventLog = {};
+    return false;
+  }
+
+  uint32_t crc = crc32_calc((const uint8_t*)(&blob), sizeof(blob) - sizeof(blob.crc32));
+  if (crc != blob.crc32) {
+    eventLog = {};
+    return false;
+  }
+
+  eventLog.count = min(blob.count, EVENT_LOG_CAPACITY);
+  eventLog.head = blob.head % EVENT_LOG_CAPACITY;
+  for (int i = 0; i < EVENT_LOG_CAPACITY; i++) eventLog.entries[i] = blob.entries[i];
+  return true;
+}
+
+void clearEventLog(bool persist) {
+  eventLog = {};
+  if (persist) saveEventLogToNVS();
+}
+
+void appendEventLog(EventCode code, float value) {
+  EventLogEntry e = {};
+  e.tsMs = millis();
+  e.code = code;
+  e.value = value;
+
+  eventLog.entries[eventLog.head] = e;
+  eventLog.head = (eventLog.head + 1) % EVENT_LOG_CAPACITY;
+  if (eventLog.count < EVENT_LOG_CAPACITY) eventLog.count++;
+
+  saveEventLogToNVS();
+}
+
+bool isLogValueNum(float v) {
+  return !isnan(v) && isfinite(v);
+}
+
+void recordEventEdge(bool active, bool &prevState, EventCode code, float value) {
+  if (active && !prevState) appendEventLog(code, value);
+  prevState = active;
 }
 
 // ================= CALIBRATION PROCESS =================
@@ -584,6 +767,16 @@ String pageHTML() {
     input[type=range]::-moz-range-track { height: 12px; background: #e2e2e2; border-radius: 12px; border: 1px solid #c8c8c8; }
     input[type=range]::-moz-range-thumb { width: 28px; height: 28px; background: #0b6cff; border-radius: 50%; border: 1px solid #0b6cff; }
     .spacer { height: 14px; }
+    .status-actions { display: flex; align-items: center; gap: 8px; }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none; align-items: center; justify-content: center; padding: 16px; }
+    .modal.show { display: flex; }
+    .modal-content { background: #fff; border-radius: 12px; padding: 16px; width: min(520px, 100%); box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .log-list { max-height: 320px; overflow-y: auto; padding: 8px 0; }
+    .log-row { padding: 6px 0; border-bottom: 1px solid #ececec; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px; }
+    .field-row { display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap; }
+    .field-row input { padding: 8px; border-radius: 8px; border: 1px solid #bbb; min-width: 90px; }
   </style>
 </head>
 <body>
@@ -592,7 +785,10 @@ String pageHTML() {
   <div class="card">
     <div class="row big">
       <div>Status</div>
-      <div id="statusMsg" class="ok">OK</div>
+      <div class="status-actions">
+        <div id="statusMsg" class="ok">OK</div>
+        <button id="logsBtn" onclick="openLogs()">Logs</button>
+      </div>
     </div>
     <div class="row small">
       <div>Mode</div>
@@ -641,6 +837,10 @@ String pageHTML() {
       <div>Calibration Table</div>
       <div class="mono" id="caltable">...</div>
     </div>
+    <div class="row small">
+      <div>Flow cal scale</div>
+      <div class="mono" id="flowScaleDisplay">...</div>
+    </div>
   </div>
 
   <div class="card">
@@ -650,6 +850,15 @@ String pageHTML() {
     <div class="big">Target Flow (L/min): <span id="flowSval">0</span></div>
     <input type="range" min="0" max="60" step="0.5" value="0" id="flowSlider" style="width:100%;" oninput="setFlowTarget(this.value)">
     <div class="small muted">Set flow &gt;0 to enable semi-automatic control (priming burst, then closed-loop).</div>
+
+    <div class="spacer"></div>
+
+    <div class="field-row">
+      <label for="flowCalScaleInput" class="big">Flow cal scale:</label>
+      <input id="flowCalScaleInput" type="number" min="0.1" max="10" step="0.01" value="1.00">
+      <button onclick="saveFlowCalScale()">Save</button>
+    </div>
+    <div class="small muted">Adjust measured flow scaling without reflashing firmware.</div>
 
     <div class="spacer"></div>
 
@@ -665,6 +874,21 @@ String pageHTML() {
     <button id="alarmToggleBtn" onclick="toggleAlarm()" style="display:none;">Toggle Alarm</button>
 
     <div class="small" style="margin-top:10px;">IP: <code>192.168.4.1</code></div>
+  </div>
+
+  <div id="logModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="big">Event log (last 10)</div>
+        <button onclick="closeLogs()">Close</button>
+      </div>
+      <div class="small muted">Newest first. Values are captured when each event first triggered.</div>
+      <div id="logList" class="log-list mono">Loading...</div>
+      <div class="modal-actions">
+        <button onclick="clearLogs()">Clear history</button>
+        <button onclick="closeLogs()">Close</button>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -691,6 +915,75 @@ const sliderEl = document.getElementById("slider");
 const flowSliderEl = document.getElementById("flowSlider");
 ["pointerdown","touchstart","mousedown"].forEach(evt => flowSliderEl.addEventListener(evt, () => { flowSliderActive = true; }));
 ["pointerup","pointercancel","pointerleave","touchend","touchcancel","mouseup"].forEach(evt => flowSliderEl.addEventListener(evt, () => { flowSliderActive = false; }));
+
+const logModal = document.getElementById("logModal");
+const logList = document.getElementById("logList");
+const flowCalScaleInput = document.getElementById("flowCalScaleInput");
+const flowScaleDisplay = document.getElementById("flowScaleDisplay");
+
+function formatLogValue(v){
+  if (v === null || Number.isNaN(v) || typeof v !== "number") return "n/a";
+  if (Math.abs(v) >= 100) return v.toFixed(0);
+  return v.toFixed(2);
+}
+
+function renderLogs(data){
+  if (!logList) return;
+  logList.innerHTML = "";
+  if (!data || !Array.isArray(data.events) || data.events.length === 0) {
+    logList.textContent = "No events recorded.";
+    return;
+  }
+  data.events.forEach(ev => {
+    const row = document.createElement("div");
+    row.className = "log-row";
+    const tsText = (typeof ev.ts === "number") ? ` @${(ev.ts/1000).toFixed(1)}s` : "";
+    const label = ev.label || `Code ${ev.code}`;
+    row.textContent = `${label} — value: ${formatLogValue(ev.value)}${tsText}`;
+    logList.appendChild(row);
+  });
+}
+
+async function refreshLogs(){
+  if (!logList) return;
+  logList.textContent = "Loading...";
+  try{
+    const r = await fetch('/logs', {cache: "no-store"});
+    const d = await r.json();
+    renderLogs(d);
+  }catch(e){
+    logList.textContent = "Failed to load logs.";
+  }
+}
+
+function openLogs(){
+  if (!logModal) return;
+  logModal.classList.add("show");
+  refreshLogs();
+}
+
+function closeLogs(){
+  if (!logModal) return;
+  logModal.classList.remove("show");
+}
+
+async function clearLogs(){
+  try{ await fetch('/logs?clear=1'); } catch(e){}
+  refreshLogs();
+}
+
+async function saveFlowCalScale(){
+  if (!flowCalScaleInput) return;
+  const val = Number(flowCalScaleInput.value);
+  if (!isFinite(val) || val <= 0) {
+    alert("Please enter a positive number for flow calibration scale.");
+    return;
+  }
+  try{
+    await fetch('/set?flowCalScale=' + encodeURIComponent(val.toFixed(3)));
+    refresh();
+  }catch(e){}
+}
 
 async function refresh(){
   try{
@@ -768,6 +1061,12 @@ async function refresh(){
         s += steps[i] + "%=" + Number(d.cal[i]).toFixed(1) + " ";
       }
       caltable.textContent = s.trim();
+    }
+    if (typeof d.flowCalScale === "number") {
+      if (flowScaleDisplay) flowScaleDisplay.textContent = d.flowCalScale.toFixed(3);
+      if (flowCalScaleInput && !flowCalScaleInput.matches(":focus")) {
+        flowCalScaleInput.value = d.flowCalScale.toFixed(3);
+      }
     }
 
     muteBtn.disabled = !d.alarm;
@@ -972,6 +1271,7 @@ void handleData() {
   json += "\"flowHz\":"   + String(fHz, 2) + ",";
   json += "\"flowDp\":"   + String((uint32_t)flowDpLast) + ",";
   json += "\"flowTargetLmin\":" + String(manualFlowTargetLmin, 2) + ",";
+  json += "\"flowCalScale\":" + String(flowCalScale, 3) + ",";
 
   json += "\"tCat\":" + (isNum(tCat) ? String(tCat, 1) : String("null")) + ",";
   json += "\"tMix\":" + (isNum(tMix) ? String(tMix, 1) : String("null")) + ",";
@@ -1064,6 +1364,15 @@ void handleSet() {
     }
   }
 
+  if (server.hasArg("flowCalScale")) {
+    float s = server.arg("flowCalScale").toFloat();
+    if (s > 0.0f && s <= 10.0f) {
+      flowCalScale = s;
+      flowCalScaleNeedsPersist = true;
+      saveCalToNVS(calFlowLmin);
+    }
+  }
+
   if (server.hasArg("mute")) {
     int m = server.arg("mute").toInt();
     if (m == 1) {
@@ -1076,6 +1385,32 @@ void handleSet() {
   }
 
   server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleLogs() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Pragma", "no-cache");
+
+  if (server.hasArg("clear")) {
+    clearEventLog(true);
+    server.send(200, "application/json; charset=utf-8", "{\"events\":[]}");
+    return;
+  }
+
+  String json = "{\"events\":[";
+  for (int i = 0; i < eventLog.count; i++) {
+    int idx = (EVENT_LOG_CAPACITY + eventLog.head - 1 - i) % EVENT_LOG_CAPACITY; // newest first
+    const EventLogEntry &e = eventLog.entries[idx];
+    json += "{\"code\":" + String((uint32_t)e.code) + ",";
+    json += "\"label\":\"" + eventLabel(e.code) + "\",";
+    json += "\"value\":";
+    json += isLogValueNum(e.value) ? String(e.value, 2) : String("null");
+    json += ",";
+    json += "\"ts\":" + String((uint32_t)e.tsMs) + "}";
+    if (i < eventLog.count - 1) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json; charset=utf-8", json);
 }
 
 // ================= CALIBRATE / RESTORE HANDLERS =================
@@ -1177,7 +1512,7 @@ void updateFlow() {
   float hz = (dtMs > 0) ? (dp * 1000.0f / dtMs) : 0.0f;
   flowHz_x100 = (uint32_t)(hz * 100.0f + 0.5f);
 
-  float qLmin = (hz / FLOW_HZ_PER_LMIN) * FLOW_CAL_SCALE;
+  float qLmin = (hz / FLOW_HZ_PER_LMIN) * flowCalScale;
   if (qLmin < 0) qLmin = 0;
   if (FLOW_CLAMP_LMIN > 0 && qLmin > FLOW_CLAMP_LMIN) qLmin = FLOW_CLAMP_LMIN;
 
@@ -1467,6 +1802,29 @@ void updateAlarmLogic() {
   int newLevel = 0;
   bool any = false;
 
+  static bool prevMixWarn = false;
+  static bool prevMixHigh = false;
+  static bool prevMixCrit = false;
+  static bool prevMixFault = false;
+  static bool prevCatHigh = false;
+  static bool prevCatCrit = false;
+  static bool prevCatFault = false;
+  static bool prevFlowNoMove = false;
+  static bool prevFlowRestrict = false;
+  static bool prevFlowUnexpected = false;
+  static bool prevFlowCalMismatch = false;
+  static bool prevCalAttention = false;
+  static bool prevHallFault = false;
+
+  bool mixWarn = isNum(tMix) && tMix >= MIX_WARN_C && tMix < MIX_HIGH_C;
+  bool mixHigh = isNum(tMix) && tMix >= MIX_HIGH_C && tMix < MIX_CRIT_C;
+  bool mixCrit = isNum(tMix) && tMix >= MIX_CRIT_C;
+  bool mixFault = !isNum(tMix);
+
+  bool catHigh = isNum(tCat) && tCat >= CAT_HIGH_C && tCat < CAT_CRIT_C;
+  bool catCrit = isNum(tCat) && tCat >= CAT_CRIT_C;
+  bool catFault = !isNum(tCat);
+
   // sensor faults => critical
   if (!isNum(tMix) || !isNum(tCat)) { newLevel = 3; any = true; }
 
@@ -1491,6 +1849,21 @@ void updateAlarmLogic() {
 
   alarmActive = any;
   alarmLevel = newLevel;
+
+  recordEventEdge(mixWarn, prevMixWarn, EVENT_MIX_WARN, tMix);
+  recordEventEdge(mixHigh, prevMixHigh, EVENT_MIX_HIGH, tMix);
+  recordEventEdge(mixCrit, prevMixCrit, EVENT_MIX_CRIT, tMix);
+  recordEventEdge(mixFault, prevMixFault, EVENT_MIX_SENSOR_FAULT, tMix);
+  recordEventEdge(catHigh, prevCatHigh, EVENT_CAT_HIGH, tCat);
+  recordEventEdge(catCrit, prevCatCrit, EVENT_CAT_CRIT, tCat);
+  recordEventEdge(catFault, prevCatFault, EVENT_CAT_SENSOR_FAULT, tCat);
+
+  recordEventEdge(flowNoMoveFault, prevFlowNoMove, EVENT_FLOW_NO_MOVE, flow_Lmin);
+  recordEventEdge(flowRestrictFault, prevFlowRestrict, EVENT_FLOW_RESTRICT, flow_Lmin);
+  recordEventEdge(flowUnexpectedFault, prevFlowUnexpected, EVENT_FLOW_UNEXPECTED, flow_Lmin);
+  recordEventEdge(flowCalMismatchFault, prevFlowCalMismatch, EVENT_FLOW_CAL_MISMATCH, flow_Lmin);
+  recordEventEdge(calWarningLevel1, prevCalAttention, EVENT_CAL_ATTENTION, 0.0f);
+  recordEventEdge(hallSensorFault, prevHallFault, EVENT_HALL_FAULT, rpmValue);
 
   if (autoMode && manualAlarmOverride) {
     manualAlarmOverride = false;
@@ -1570,6 +1943,9 @@ void setup() {
   pinMode(RPM_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RPM_PIN), isrRpm, FALLING);
 
+  // ---- Load stored event log ----
+  loadEventLogFromNVS();
+
   // ---- Load calibration (READ ONLY at startup - NO WRITES) ----
   float tmp[CAL_STEPS];
   CalState st;
@@ -1614,6 +1990,10 @@ void setup() {
   for (int i = 0; i < CAL_STEPS; i++) calFlowLmin_lastGood[i] = calFlowLmin[i];
   hasLastGoodInRam = true;
 
+  if (flowCalScaleNeedsPersist) {
+    saveCalToNVS(calFlowLmin);
+  }
+
   // ---- Start AP ----
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ap_ssid, ap_pass);
@@ -1622,6 +2002,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/set", handleSet);
+  server.on("/logs", handleLogs);
   server.on("/calibrate", handleCalibrate);
   server.on("/restore", handleRestore);
   server.begin();
