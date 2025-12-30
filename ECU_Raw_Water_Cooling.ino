@@ -1316,7 +1316,6 @@ void updatePumpControlAndFlowChecks() {
 
       if (isNum(tMix) && tMix >= MIX_CRIT_C) targetPwm = 99;
       else if (boostActive) targetPwm = min(99, targetPwm + 10);
-      manualFlowControlPwmF = targetPwm;
     } else {
       targetPwm = 0;
       boostActive = false;
