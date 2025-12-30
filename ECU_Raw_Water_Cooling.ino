@@ -30,6 +30,8 @@ const float RPM_PULSES_PER_REV = 2.0f;
 
 // Prius engine running threshold (edit here if needed)
 const int ENGINE_RPM_MIN = 800;  // <<<<< change this if needed
+const uint32_t HALL_RPM_LOW_HOLD_MS = 5000;
+const int HALL_RPM_HIGH_THRESHOLD = 6000;
 
 // ===== Pump command mapping =====
 const int PUMP_PWM_MIN = 10;      // minimum command when pump should be on (you can tune later)
@@ -132,6 +134,10 @@ volatile uint32_t rpmPulses = 0;
 volatile float    rpmValue  = 0.0f;
 volatile uint32_t rpmHz_x100 = 0;
 volatile uint32_t rpmDpLast  = 0;
+bool hallSensorFault = false;
+uint32_t rpmLowFaultSince = 0;
+bool hallSensorFault = false;
+uint32_t rpmLowFaultSince = 0;
 
 // Alarm
 bool alarmActive = false;
@@ -882,6 +888,7 @@ void handleData() {
 
     if (!isNum(tMix)) msg += "Mixer sensor FAULT; ";
     if (!isNum(tCat)) msg += "Cat sensor FAULT; ";
+    if (hallSensorFault) msg += "Hall sensor malfunction; ";
 
     if (isNum(tMix)) {
       if (tMix >= MIX_CRIT_C) msg += "Mixer OVERHEAT; ";
@@ -958,6 +965,7 @@ void handleData() {
   json += "\"rpm\":"    + String((int)(rpmValue + 0.5f)) + ",";
   json += "\"rpmHz\":"  + String(rHz, 2) + ",";
   json += "\"rpmDp\":"  + String((uint32_t)rpmDpLast) + ",";
+  json += "\"hallFault\":" + String(hallSensorFault ? "true" : "false") + ",";
 
   json += "\"flowLmin\":" + String(flow_Lmin, 3) + ",";
   json += "\"flowLh\":"   + String(flow_Lh, 1) + ",";
@@ -1200,6 +1208,24 @@ void updateRPM() {
   float r = (RPM_PULSES_PER_REV > 0.0f) ? (hz * 60.0f / RPM_PULSES_PER_REV) : 0.0f;
   if (r < 0) r = 0;
   rpmValue = r;
+
+  // Hall sensor fault detection:
+  // - Fuel pump active AND RPM < ENGINE_RPM_MIN for > HALL_RPM_LOW_HOLD_MS
+  // - RPM > HALL_RPM_HIGH_THRESHOLD immediately
+  bool lowRpmWhileFuel = (fuelActive && rpmValue < ENGINE_RPM_MIN);
+
+  if (lowRpmWhileFuel) {
+    if (rpmLowFaultSince == 0) rpmLowFaultSince = now;
+    if (now - rpmLowFaultSince >= HALL_RPM_LOW_HOLD_MS) hallSensorFault = true;
+  } else {
+    rpmLowFaultSince = 0;
+  }
+
+  if (rpmValue > HALL_RPM_HIGH_THRESHOLD) {
+    hallSensorFault = true;
+  } else if (!lowRpmWhileFuel) {
+    hallSensorFault = false;
+  }
 }
 
 void updateCalibration() {
@@ -1459,6 +1485,7 @@ void updateAlarmLogic() {
   if (flowUnexpectedFault)    { newLevel = max(newLevel, 3); any = true; }
   if (flowRestrictFault)      { newLevel = max(newLevel, 2); any = true; }
   if (flowCalMismatchFault)   { newLevel = max(newLevel, 2); any = true; }
+  if (hallSensorFault)        { newLevel = max(newLevel, 3); any = true; }
 
   if (calWarningLevel1)       { newLevel = max(newLevel, 1); any = true; }
 
