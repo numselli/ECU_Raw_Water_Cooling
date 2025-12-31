@@ -77,7 +77,7 @@ const float FLOW_PRIME_DETECT_LMIN = 0.3f;
 const float FLOW_CONTROL_KP = 1.15f;
 const float FLOW_CONTROL_HYST = 0.05f;
 const float FLOW_CONTROL_TARGET_TOL_FRAC = 0.01f;   // try to stay within 1% of target
-  const float FLOW_CONTROL_MIN_STEP = 0.2f;           // minimum adjustment when reacting
+const float FLOW_CONTROL_MIN_STEP = 0.2f;           // minimum adjustment when reacting
 const float FLOW_CONTROL_STEP_UP_PPS = 10.0f;       // closed-loop increase rate (PWM per second)
 const float FLOW_CONTROL_STEP_DOWN_PPS = 10.0f;     // closed-loop decrease rate (PWM per second)
 const float FLOW_CONTROL_SLOPE_FLOOR = 0.08f;       // l/min per PWM step used for division safety
@@ -199,7 +199,7 @@ EventLog eventLog = {};
 
 // ================= Calibration table =================
 const int CAL_STEPS = 9;
-int   calPwmStep[CAL_STEPS] = {20,30,40,50,60,70,80,90,100};
+int calPwmStep[CAL_STEPS] = {20,30,40,50,60,70,80,90,100};
 float calFlowLmin[CAL_STEPS];
 
 // Built-in default calibration (dummy safe placeholders; replace later with your real “factory defaults”)
@@ -207,12 +207,12 @@ float DEFAULT_CAL_FLOW_LMIN[CAL_STEPS] = {
   0.0f, 1.0f, 3.3f, 5.3f, 7.4f, 9.5f, 11.4f, 13.3f, 15.8f
 };
 
-bool  calibrateComplete = false;      // “valid and usable for restriction logic”
-bool  calibrating = false;
+bool calibrateComplete = false;      // “valid and usable for restriction logic”
+bool calibrating = false;
 
 // keep last known-good calibration in RAM to prevent bad calibration overwrite
 float calFlowLmin_lastGood[CAL_STEPS];
-bool  hasLastGoodInRam = false;
+bool hasLastGoodInRam = false;
 
 // Calibration result reporting
 bool calibLastOk = true;
@@ -418,8 +418,7 @@ float flowSlopeFromCalAtPwm(float pwm) {
     }
   }
 
-  float slope = (calFlowLmin[CAL_STEPS-1] - calFlowLmin[CAL_STEPS-2]) /
-                float(calPwmStep[CAL_STEPS-1] - calPwmStep[CAL_STEPS-2]);
+  float slope = (calFlowLmin[CAL_STEPS-1] - calFlowLmin[CAL_STEPS-2]) / float(calPwmStep[CAL_STEPS-1] - calPwmStep[CAL_STEPS-2]);
   return max(FLOW_CONTROL_SLOPE_FLOOR, slope);
 }
 
@@ -898,6 +897,7 @@ function applyLevel(el, level){
   if (level >= 2) el.classList.add("error");
   else if (level === 1) el.classList.add("warn");
 }
+const isNumber = input => typeof input === "number"
 
 let currentAutoMode = true;
 let sliderActive = false;
@@ -978,41 +978,36 @@ async function clearLogs(){
 async function saveFlowCalScale(){
   if (!flowCalScaleInput) return;
   const val = Number(flowCalScaleInput.value);
-  if (!isFinite(val) || val <= 0) {
-    alert("Please enter a positive number for flow calibration scale.");
-    return;
-  }
+  if (!isFinite(val) || val <= 0) return alert("Please enter a positive number for flow calibration scale.");
   try{
     await fetch('/set?flowCalScale=' + encodeURIComponent(val.toFixed(3)));
     refresh();
   }catch(e){}
 }
-
 async function refresh(){
   try{
     const r = await fetch('/data', {cache: "no-store"});
     const d = await r.json();
 
-    fuel.textContent  = d.fuel ? "ON" : "off";
+    fuel.textContent = d.fuel ? "ON" : "off";
 
-    rpm.textContent   = (typeof d.rpm === "number" ? d.rpm : 0);
-    rpmhz.textContent = (typeof d.rpmHz === "number" ? d.rpmHz.toFixed(2) : "0.00");
-    rpmdp.textContent = (typeof d.rpmDp === "number" ? d.rpmDp : 0);
+    rpm.textContent = isNumber(d.rpm) ? d.rpm : 0;
+    rpmhz.textContent = isNumber(d.rpmHz) ? d.rpmHz.toFixed(2) : "0.00";
+    rpmdp.textContent = isNumber(d.rpmDp) ? d.rpmDp : 0;
 
-    const flm = (typeof d.flowLmin === "number") ? d.flowLmin : 0;
-    const flh = (typeof d.flowLh   === "number") ? d.flowLh   : 0;
-    flow.textContent  = flm.toFixed(2);
+    const flm = isNumber(d.flowLmin) ? d.flowLmin : 0;
+    const flh = isNumber(d.flowLh) ? d.flowLh   : 0;
+    flow.textContent = flm.toFixed(2);
     flowh.textContent = flh.toFixed(0);
-    flowhz.textContent = (typeof d.flowHz === "number" ? d.flowHz.toFixed(2) : "0.00");
-    flowdp.textContent = (typeof d.flowDp === "number" ? d.flowDp : 0);
+    flowhz.textContent = isNumber(d.flowHz) ? d.flowHz.toFixed(2) : "0.00";
+    flowdp.textContent = isNumber(d.flowDp) ? d.flowDp : 0;
 
-    tcat.textContent  = (typeof d.tCat === "number" ? d.tCat.toFixed(1) : "FAULT");
-    tmix.textContent  = (typeof d.tMix === "number" ? d.tMix.toFixed(1) : "FAULT");
+    tcat.textContent = isNumber(d.tCat) ? d.tCat.toFixed(1) : "FAULT");
+    tmix.textContent = isNumber(d.tMix) ? d.tMix.toFixed(1) : "FAULT");
 
-    pwm.textContent   = d.pwm;
-    x9c.textContent   = d.x9c;
-    const alarmLevelText = (typeof d.alarmLevel === "number" && d.alarmLevel > 0) ? ` (Level ${d.alarmLevel})` : "";
-    alarm.textContent = d.alarm ? `ON${alarmLevelText}` : "off";
+    pwm.textContent = d.pwm;
+    x9c.textContent = d.x9c;
+    alarm.textContent = d.alarm ? `${(isNumber(d.alarmLevel) && d.alarmLevel > 0) ? `ON (Level ${d.alarmLevel})` : ""}` : "off";
 
     applyLevel(tmix, Number(d.tMixLevel || 0));
     applyLevel(tcat, Number(d.tCatLevel || 0));
@@ -1025,8 +1020,7 @@ async function refresh(){
     statusMsg.classList.add(d.statusClass || "ok");
 
     calStatus.textContent = d.calMsg || "OK";
-    const calClass = d.calFail ? "error" : (d.calOk ? "ok" : "warn");
-    calStatus.className = "mono " + calClass;
+    calStatus.className = `mono ${d.calFail ? "error" : (d.calOk ? "ok" : "warn")}`;
 
     currentAutoMode = !!d.autoMode;
     modeBtn.textContent = "Change mode";
@@ -1048,14 +1042,10 @@ async function refresh(){
     restoreBtn.disabled = !manual || d.calibrating;   // ONLY manual mode
     restoreBtn.style.display = manual ? "inline" : "none";
 
-    if (manual) {
-      alarmToggleBtn.style.display = "inline";
-      alarmToggleBtn.textContent = (d.alarmRelaySilenced ? "Sound Alarm" : "Silence Alarm");
-    } else {
-      alarmToggleBtn.style.display = "none";
-    }
+    alarmToggleBtn.style.display = manual ? "inline" : "none"
+    if (manual) alarmToggleBtn.textContent = (d.alarmRelaySilenced ? "Sound Alarm" : "Silence Alarm");
 
-    sval.textContent  = d.pwm;
+    sval.textContent = d.pwm;
     if (!sliderActive) sliderEl.value = d.pwm;
 
     flowSval.textContent = flowTarget.toFixed(1);
@@ -1063,18 +1053,12 @@ async function refresh(){
 
     // cal table display
     if (Array.isArray(d.cal) && d.cal.length === 9) {
-      const steps = [20,30,40,50,60,70,80,90,100];
-      let s = "";
-      for (let i=0;i<steps.length;i++){
-        s += steps[i] + "%=" + Number(d.cal[i]).toFixed(1) + " ";
-      }
+      const s = [20,30,40,50,60,70,80,90,100].map((step, i)=>`${step}%=${Number(d.cal[i]).toFixed(1)}`).join(" ");
       caltable.textContent = s.trim();
     }
     if (typeof d.flowCalScale === "number") {
       if (flowScaleDisplay) flowScaleDisplay.textContent = d.flowCalScale.toFixed(3);
-      if (flowCalScaleInput && !flowCalScaleInput.matches(":focus")) {
-        flowCalScaleInput.value = d.flowCalScale.toFixed(3);
-      }
+      if (flowCalScaleInput && !flowCalScaleInput.matches(":focus")) {flowCalScaleInput.value = d.flowCalScale.toFixed(3);}
     }
 
     muteBtn.disabled = !d.alarm;
@@ -1102,13 +1086,10 @@ async function setPWM(v){
 
   sendingPwm = true;
   while (pendingPwmValue !== null) {
-    const next = pendingPwmValue;
-    pendingPwmValue = null;
     try {
-      await fetch('/set?pwm=' + next);
-    } catch(e) {
-      // swallow
-    }
+      await fetch('/set?pwm=' + pendingPwmValue);
+    } catch(e) {}
+    pendingPwmValue = null
   }
   sendingPwm = false;
 }
@@ -1121,13 +1102,10 @@ async function setFlowTarget(v){
 
   sendingFlow = true;
   while (pendingFlowValue !== null) {
-    const next = pendingFlowValue;
-    pendingFlowValue = null;
     try {
-      await fetch('/set?flow=' + next);
-    } catch(e) {
-      // swallow
-    }
+      await fetch('/set?flow=' + pendingFlowValue);
+    } catch(e) {}
+    pendingFlowValue = null;
   }
   sendingFlow = false;
 }
@@ -1253,13 +1231,8 @@ void handleData() {
     calOk = false;
     calError = true;
   } else if (calState == CAL_DEFAULT_RECOMMENDED) {
-    if (calUsingDefault) {
-      calMsg = "OK (default)";
-      calOk = true;
-    } else {
-      calMsg = "Calibration recommended";
-      calOk = false;
-    }
+    calMsg = calUsingDefault ? "OK (default)" : "Calibration recommended"
+    calOk = calUsingDefault ? true : false 
   } else {
     calMsg = calUsingDefault ? "OK (default)" : "OK";
     calOk = true;
@@ -1847,13 +1820,12 @@ void updateAlarmLogic() {
     else if (tCat >= CAT_HIGH_C) { newLevel = max(newLevel, 2); any = true; }
   }
 
-  if (flowNoMoveFault)        { newLevel = max(newLevel, 3); any = true; }
-  if (flowUnexpectedFault)    { newLevel = max(newLevel, 3); any = true; }
-  if (flowRestrictFault)      { newLevel = max(newLevel, 2); any = true; }
-  if (flowCalMismatchFault)   { newLevel = max(newLevel, 2); any = true; }
-  if (hallSensorFault)        { newLevel = max(newLevel, 3); any = true; }
-
-  if (calWarningLevel1)       { newLevel = max(newLevel, 1); any = true; }
+  if (flowNoMoveFault) {newLevel = max(newLevel, 3); any = true; }
+  if (flowUnexpectedFault) {newLevel = max(newLevel, 3); any = true; }
+  if (flowRestrictFault) {newLevel = max(newLevel, 2); any = true; }
+  if (flowCalMismatchFault) {newLevel = max(newLevel, 2); any = true; }
+  if (hallSensorFault) {newLevel = max(newLevel, 3); any = true; }
+  if (calWarningLevel1) {newLevel = max(newLevel, 1); any = true; }
 
   alarmActive = any;
   alarmLevel = newLevel;
@@ -1873,9 +1845,7 @@ void updateAlarmLogic() {
   recordEventEdge(calWarningLevel1, prevCalAttention, EVENT_CAL_ATTENTION, 0.0f);
   recordEventEdge(hallSensorFault, prevHallFault, EVENT_HALL_FAULT, rpmValue);
 
-  if (autoMode && manualAlarmOverride) {
-    manualAlarmOverride = false;
-  }
+  if (autoMode && manualAlarmOverride) {manualAlarmOverride = false;}
 
   if (alarmMuted && millis() > alarmMutedUntil) {
     alarmMuted = false;
@@ -1903,10 +1873,7 @@ void updateAlarmLogic() {
   }
 
   if (alarmMuted && !manualAlarmOverride) shouldSound = false;
-
-  if (!autoMode && manualAlarmOverride) {
-    shouldSound = manualAlarmShouldSound;
-  }
+  if (!autoMode && manualAlarmOverride) {shouldSound = manualAlarmShouldSound;}
 
   setAlarmSilenced(!shouldSound);
 }
